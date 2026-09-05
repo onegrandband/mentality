@@ -17,29 +17,7 @@ namespace Mentality
         [STAThread]
         static void Main()
         {
-            // Request elevation if not running as administrator
-            if (!IsRunAsAdministrator())
-            {
-                try
-                {
-                    var startInfo = new ProcessStartInfo
-                    {
-                        FileName = Application.ExecutablePath,
-                        UseShellExecute = true,
-                        Verb = "runas"
-                    };
-
-                    Process.Start(startInfo);
-                }
-                catch (System.ComponentModel.Win32Exception)
-                {
-                    // User refused the elevation or an error occurred - show a friendly message and exit
-                    MessageBox.Show("Please enable admin privileges for Mentality to work.", "Admin required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
-
-                return; // Exit current (non-elevated) instance
-            }
-
+            // Run without forcing elevation. Request admin only when necessary and explain to users.
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new Form1());

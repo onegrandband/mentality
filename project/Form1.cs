@@ -26,6 +26,7 @@ namespace Mentality
         private Label lblButton;
         private RadioButton rdoLeftButton;
         private RadioButton rdoRightButton;
+        private ComboBox cmbClickType;
 
         private Label lblStartDelay;
         private NumericUpDown nudStartDelay;
@@ -55,6 +56,15 @@ namespace Mentality
         private NumericUpDown nudJitterPercent;
         private CheckBox chkPauseOnInput;
         private NumericUpDown nudPauseIdleSeconds;
+        private Button btnCheckUpdates;
+        private Button btnInstallUpdate;
+        private Label lblUpdateStatus;
+        private Button btnMiscToggle;
+        private Panel pnlMiscContent;
+        private Button btnExportData;
+        private Button btnImportData;
+        private bool miscExpanded;
+        private UpdateInfo availableUpdate;
 
         // runtime fields
         private Random rng = new Random();
@@ -64,6 +74,11 @@ namespace Mentality
         private CancellationTokenSource autoClickerCts;
         private Task autoClickerTask;
         private volatile bool isClicking;
+        private bool hotkeyRegistered;
+        private IntPtr printScreenHookHandle = IntPtr.Zero;
+        private LowLevelKeyboardProc printScreenHookCallback;
+        private bool printScreenKeyDown;
+        private int autoClickerGeneration;
 
         // target monitoring
         private Task targetMonitorTask;
@@ -75,9 +90,17 @@ namespace Mentality
         private const uint MOUSEEVENTF_LEFTUP = 0x0004;
         private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
         private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
 
         private const int WM_HOTKEY = 0x0312;
         private const int HOTKEY_ID = 0x9000;
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_KEYUP = 0x0101;
+        private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_SYSKEYUP = 0x0105;
+        private const int VK_SNAPSHOT = 0x2C;
 
         // RegisterHotKey modifier flags
         private const uint MOD_ALT = 0x0001;
@@ -99,6 +122,20 @@ namespace Mentality
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc callback, IntPtr moduleHandle, uint threadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hookHandle);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hookHandle, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
@@ -127,6 +164,7 @@ namespace Mentality
         private void BuildUi()
         {
             this.Text = "Mentality v1.2.1";
+            this.Text = "Mentality v1.3.3";
             this.Size = new Size(900, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.Sizable;
@@ -146,6 +184,7 @@ namespace Mentality
             lblInterval = new Label { Text = "Interval (ms):", Location = new Point(8, y), Size = new Size(100, 22) };
             nudIntervalMs = new NumericUpDown { Location = new Point(112, y - 2), Size = new Size(100, 24), Minimum = 0, Maximum = 10000, Value = 10 };
             trackInterval = new TrackBar { Location = new Point(220, y - 8), Size = new Size(360, 45), Minimum = 0, Maximum = 1000, Value = 10, TickFrequency = 50 };
+            trackInterval = new TrackBar { Location = new Point(220, y - 8), Size = new Size(360, 45), Minimum = 0, Maximum = 10000, Value = 10, TickFrequency = 500 };
             trackInterval.Scroll += (s, e) => { try { nudIntervalMs.Value = Math.Min(nudIntervalMs.Maximum, Math.Max(nudIntervalMs.Minimum, trackInterval.Value)); } catch { } };
             nudIntervalMs.ValueChanged += (s, e) => { try { trackInterval.Value = (int)Math.Min(trackInterval.Maximum, Math.Max(trackInterval.Minimum, (int)nudIntervalMs.Value)); } catch { } };
 
@@ -153,6 +192,9 @@ namespace Mentality
             lblButton = new Label { Text = "Mouse Button:", Location = new Point(8, y), Size = new Size(100, 22) };
             rdoLeftButton = new RadioButton { Text = "Left", Location = new Point(120, y), Checked = true };
             rdoRightButton = new RadioButton { Text = "Right", Location = new Point(180, y) };
+            cmbClickType = new ComboBox { Location = new Point(120, y - 2), Size = new Size(150, 24), DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbClickType.Items.AddRange(new object[] { "Left click", "Double click", "Right click", "Middle click" });
+            cmbClickType.SelectedIndex = 0;
 
             y += 34;
             // passphrase removed for security and to avoid malware-like behavior
@@ -167,8 +209,10 @@ namespace Mentality
 
             y += 30;
             chkUseHotkey = new CheckBox { Text = "Use global hotkey", Location = new Point(8, y), Size = new Size(140, 22) };
+            chkUseHotkey.CheckedChanged += (s, e) => TryRegisterHotkey();
             txtHotkey = new TextBox { Location = new Point(152, y - 2), Size = new Size(200, 24), ReadOnly = true, TabStop = true };
             txtHotkey.BackColor = SystemColors.Window;
+            lblHotkeyHint = new Label { Text = "Click to set a global hotkey (e.g., Win+F5).", Location = new Point(360, y), Size = new Size(400, 22), ForeColor = Color.Gray };
             // Click to begin capture; then press a key combination (e.g., Ctrl+Shift+A)
             txtHotkey.Click += (s, e) => { try { txtHotkey.ReadOnly = false; txtHotkey.Text = "Press combination..."; txtHotkey.Focus(); } catch { } };
             txtHotkey.KeyDown += (s, e) =>
@@ -185,6 +229,7 @@ namespace Mentality
                         if (e.Control) parts.Add("Ctrl");
                         if (e.Shift) parts.Add("Shift");
                         if (e.Alt) parts.Add("Alt");
+                        if (IsWinKeyDown()) parts.Add("Win");
                         txtHotkey.Text = string.Join("+", parts);
                         return;
                     }
@@ -203,6 +248,7 @@ namespace Mentality
                     if ((mods & MOD_CONTROL) != 0) names.Add("Ctrl");
                     if ((mods & MOD_SHIFT) != 0) names.Add("Shift");
                     if ((mods & MOD_ALT) != 0) names.Add("Alt");
+                    if ((mods & MOD_WIN) != 0) names.Add("Win");
                     names.Add(selectedHotkey.ToString());
                     txtHotkey.Text = string.Join("+", names);
 
@@ -233,8 +279,10 @@ namespace Mentality
             btnLoadProfile.Click += (s, e) => { try { if (cmbProfiles.SelectedItem != null) { var profileName = cmbProfiles.SelectedItem.ToString(); var p = profiles.Find(x => x.Name == profileName); if (p != null) ApplyProfile(p); lblStatus.Text = $"Profile '{profileName}' applied."; Audit($"Profile '{profileName}' loaded"); } } catch { } };
             btnSaveProfile = new Button { Text = "Save", Location = new Point(300, y), Size = new Size(60, 24) };
             btnSaveProfile.Click += (s, e) => { try { var profileName = Prompt("Save Profile","Profile name:","New Profile"); if (!string.IsNullOrWhiteSpace(profileName)) { var p = new Profile { Name = profileName, IntervalMs = (int)nudIntervalMs.Value, RightButton = rdoRightButton.Checked, StartDelay = (int)nudStartDelay.Value, AutoMinimize = chkAutoMinimize.Checked, RunWhenMinimized = chkRunWhenMinimized.Checked, UseHotkey = chkUseHotkey.Checked, HotkeyKey = selectedHotkey==Keys.None?string.Empty:selectedHotkey.ToString(), HotkeyModifiers = (int)selectedHotkeyModifiers, LimitToSpecificWindow = chkLimitToSpecificWindow.Checked, TargetWindows = txtTargetGameWindows.Text, JitterPercent = (int)nudJitterPercent.Value, PauseOnUserInput = chkPauseOnInput.Checked }; profiles.RemoveAll(x=>x.Name==profileName); profiles.Add(p); ProfilesManager.SaveProfiles(profiles); RefreshProfilesCombo(); lblStatus.Text = $"Saved profile '{profileName}'."; Audit($"Profile '{profileName}' saved"); } } catch { } };
+            btnSaveProfile.Click += SaveProfileClicked;
             btnDeleteProfile = new Button { Text = "Delete", Location = new Point(364, y), Size = new Size(60, 24) };
             btnDeleteProfile.Click += (s, e) => { try { if (cmbProfiles.SelectedItem != null) { var profileName = cmbProfiles.SelectedItem.ToString(); if (MessageBox.Show($"Delete profile '{profileName}'?","Confirm",MessageBoxButtons.YesNo,MessageBoxIcon.Warning)==DialogResult.Yes) { profiles.RemoveAll(x=>x.Name==profileName); ProfilesManager.SaveProfiles(profiles); RefreshProfilesCombo(); lblStatus.Text = $"Deleted profile '{profileName}'"; Audit($"Profile '{profileName}' deleted"); } } } catch { } };
+            btnDeleteProfile.Click += (s, e) => { try { if (cmbProfiles.SelectedItem != null) { var profileName = cmbProfiles.SelectedItem.ToString(); if (MessageBox.Show($"Delete profile '{profileName}'?","Confirm",MessageBoxButtons.YesNo,MessageBoxIcon.Warning)==DialogResult.Yes) { profiles.RemoveAll(x=>x.Name==profileName); if (!ProfilesManager.SaveProfiles(profiles)) { profiles = ProfilesManager.LoadProfiles(); RefreshProfilesCombo(); lblStatus.Text = "Could not delete the profile."; return; } RefreshProfilesCombo(); lblStatus.Text = $"Deleted profile '{profileName}'"; Audit($"Profile '{profileName}' deleted"); } } } catch (Exception ex) { LogError(ex); lblStatus.Text = "Could not delete the profile."; } };
 
             btnStartClicker = new Button { Text = "Start Clicking", Location = new Point(8, y+40), Size = new Size(140, 40) };
             btnStartClicker.Click += (s, e) => StartAutoClicker();
@@ -254,6 +302,7 @@ namespace Mentality
                     Properties.Settings.Default.HotkeyModifiers = 0;
                     Properties.Settings.Default.Save();
                     try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
+                    TryRegisterHotkey();
                     lblStatus.Text = "Hotkey cleared.";
                     Audit("Hotkey cleared by user");
                 }
@@ -262,6 +311,20 @@ namespace Mentality
 
             // Misc group
             var grpMisc = new GroupBox { Text = "Misc (advanced)", Location = new Point(8, y+92), Size = new Size(760, 180) };
+            // Misc accordion
+            btnMiscToggle = new Button { Text = "Misc (advanced)   ▶", Location = new Point(8, y+92), Size = new Size(760, 30), TextAlign = ContentAlignment.MiddleLeft, FlatStyle = FlatStyle.Flat };
+            pnlMiscContent = new Panel { Location = new Point(8, y+122), Size = new Size(760, 220), BorderStyle = BorderStyle.FixedSingle, Visible = false };
+            mainPanel.AutoScrollMinSize = new Size(0, btnMiscToggle.Bottom + 8);
+            btnMiscToggle.Click += (s, e) =>
+            {
+                miscExpanded = !miscExpanded;
+                pnlMiscContent.Visible = miscExpanded;
+                btnMiscToggle.Text = miscExpanded ? "Misc (advanced)   ▼" : "Misc (advanced)   ▶";
+                mainPanel.AutoScrollMinSize = new Size(0, (miscExpanded ? pnlMiscContent.Bottom : btnMiscToggle.Bottom) + 8);
+                mainPanel.PerformLayout();
+                if (miscExpanded) mainPanel.ScrollControlIntoView(pnlMiscContent);
+                else mainPanel.ScrollControlIntoView(btnMiscToggle);
+            };
 
             chkSchedule = new CheckBox { Text = "Schedule start", Location = new Point(12, 20), Size = new Size(120, 22) };
             dtpStartTime = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd HH:mm:ss", Location = new Point(140, 20), Size = new Size(200, 24) };
@@ -279,6 +342,17 @@ namespace Mentality
             var lblTargetNote = new Label { Text = "When target app is closed or minimized the clicker pauses; it will resume automatically when the app is restored.", Location = new Point(12, 92), Size = new Size(720, 34), ForeColor = Color.DarkBlue };
 
             grpMisc.Controls.AddRange(new Control[] { chkSchedule, dtpStartTime, nudRunMinutes, lblRunMinutes, nudJitterPercent, lblJitter, chkPauseOnInput, nudPauseIdleSeconds, lblPauseHint, lblTargetNote });
+            btnCheckUpdates = new Button { Text = "Check for updates", Location = new Point(12, 140), Size = new Size(140, 28) };
+            btnCheckUpdates.Click += CheckForUpdatesClicked;
+            btnInstallUpdate = new Button { Text = "Install update", Location = new Point(160, 140), Size = new Size(120, 28), Enabled = false };
+            btnInstallUpdate.Click += InstallUpdateClicked;
+            lblUpdateStatus = new Label { Text = "Check online for a newer version.", Location = new Point(292, 144), Size = new Size(440, 24), ForeColor = Color.Gray };
+            btnExportData = new Button { Text = "Export data...", Location = new Point(12, 178), Size = new Size(120, 28) };
+            btnExportData.Click += ExportDataClicked;
+            btnImportData = new Button { Text = "Import data...", Location = new Point(144, 178), Size = new Size(120, 28) };
+            btnImportData.Click += ImportDataClicked;
+
+            pnlMiscContent.Controls.AddRange(new Control[] { chkSchedule, dtpStartTime, nudRunMinutes, lblRunMinutes, nudJitterPercent, lblJitter, chkPauseOnInput, nudPauseIdleSeconds, lblPauseHint, lblTargetNote, btnCheckUpdates, btnInstallUpdate, lblUpdateStatus, btnExportData, btnImportData });
 
 
             mainPanel.Controls.Add(lblStatus);
@@ -289,6 +363,7 @@ namespace Mentality
             mainPanel.Controls.Add(lblButton);
             mainPanel.Controls.Add(rdoLeftButton);
             mainPanel.Controls.Add(rdoRightButton);
+            mainPanel.Controls.Add(cmbClickType);
             mainPanel.Controls.Add(lblStartDelay);
             mainPanel.Controls.Add(nudStartDelay);
             mainPanel.Controls.Add(chkAutoMinimize);
@@ -307,6 +382,8 @@ namespace Mentality
             mainPanel.Controls.Add(btnStartClicker);
             mainPanel.Controls.Add(btnStopClicker);
             mainPanel.Controls.Add(grpMisc);
+            mainPanel.Controls.Add(btnMiscToggle);
+            mainPanel.Controls.Add(pnlMiscContent);
 
             // footer
             var sep = new Panel { Dock = DockStyle.Bottom, Height = 28, BackColor = Color.Gainsboro };
@@ -319,12 +396,41 @@ namespace Mentality
 
         private void TryRegisterHotkey()
         {
+            if (chkUseHotkey == null || !IsHandleCreated) return;
+
             try
             {
                 try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
+                UnregisterCurrentHotkey();
+
+                if (!chkUseHotkey.Checked) return;
                 var vk = GetSelectedHotkeyVk();
                 var mods = GetSelectedHotkeyModifiers();
                 if (vk != 0 && chkUseHotkey != null && chkUseHotkey.Checked)
+                if (vk == VK_SNAPSHOT)
+                {
+                    printScreenHookCallback = PrintScreenKeyboardProc;
+                    printScreenHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, printScreenHookCallback, GetModuleHandle(null), 0);
+                    if (printScreenHookHandle == IntPtr.Zero)
+                    {
+                        var err = Marshal.GetLastWin32Error();
+                        var friendly = $"Print Screen hotkey registration failed (error {err}).";
+                        LogError(new Exception($"SetWindowsHookEx failed ({err})"));
+                        lblStatus.Text = friendly;
+                        Audit($"Print Screen hotkey registration failed (err={err})");
+                        HotkeyLog($"SetWindowsHookEx failed err={err}, mods={mods}");
+                        MessageBox.Show(this, friendly, "Hotkey failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    else
+                    {
+                        Audit($"Print Screen hook registered (mods={mods})");
+                        HotkeyLog($"Print Screen hook registered mods={mods}");
+                        lblStatus.Text = "Print Screen hotkey registered.";
+                    }
+                    return;
+                }
+
+                if (vk != 0)
                 {
                     if (!RegisterHotKey(this.Handle, HOTKEY_ID, mods, vk))
                     {
@@ -340,6 +446,7 @@ namespace Mentality
                     }
                     else
                     {
+                        hotkeyRegistered = true;
                         try { this.Invoke(new Action(() => lblStatus.Text = "Hotkey registered.")); } catch { }
                         Audit($"Hotkey registered: {mods}+{vk}");
                         HotkeyLog($"RegisterHotKey succeeded mods={mods}, vk={vk}");
@@ -354,13 +461,154 @@ namespace Mentality
             }
         }
 
+        private Profile CaptureCurrentSettings(string name)
+        {
+            return new Profile
+            {
+                Name = name,
+                IntervalMs = (int)nudIntervalMs.Value,
+                RightButton = cmbClickType.SelectedIndex == 2,
+                MouseClickType = GetMouseClickTypeName(),
+                StartDelay = (int)nudStartDelay.Value,
+                AutoMinimize = chkAutoMinimize.Checked,
+                RunWhenMinimized = chkRunWhenMinimized.Checked,
+                UseHotkey = chkUseHotkey.Checked,
+                HotkeyKey = selectedHotkey == Keys.None ? string.Empty : selectedHotkey.ToString(),
+                HotkeyModifiers = (int)selectedHotkeyModifiers,
+                LimitToSpecificWindow = chkLimitToSpecificWindow.Checked,
+                TargetWindows = txtTargetGameWindows.Text,
+                JitterPercent = (int)nudJitterPercent.Value,
+                PauseOnUserInput = chkPauseOnInput.Checked,
+                ScheduleEnabled = chkSchedule.Checked,
+                ScheduledStartTime = dtpStartTime.Value,
+                RunMinutes = (int)nudRunMinutes.Value,
+                PauseIdleSeconds = (int)nudPauseIdleSeconds.Value
+            };
+        }
+
+        private void SaveProfileClicked(object sender, EventArgs e)
+        {
+            try
+            {
+                var name = Prompt("Save Profile", "Profile name:", "New Profile");
+                if (string.IsNullOrWhiteSpace(name)) return;
+
+                name = name.Trim();
+                profiles.RemoveAll(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+                profiles.Add(CaptureCurrentSettings(name));
+                if (!ProfilesManager.SaveProfiles(profiles))
+                {
+                    lblStatus.Text = "Could not save the profile.";
+                    return;
+                }
+
         private void StartTargetMonitor()
+                RefreshProfilesCombo();
+                cmbProfiles.SelectedItem = name;
+                lblStatus.Text = $"Saved profile '{name}'.";
+                Audit($"Profile '{name}' saved");
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                lblStatus.Text = "Could not save the profile.";
+            }
+        }
+        private void UnregisterCurrentHotkey()
+        {
+            UnregisterPrintScreenHook();
+            if (!hotkeyRegistered || !IsHandleCreated)
+            {
+                hotkeyRegistered = false;
+                return;
+            }
+
+            try { UnregisterHotKey(this.Handle, HOTKEY_ID); }
+            catch { }
+            finally { hotkeyRegistered = false; }
+        }
+
+        private void UnregisterPrintScreenHook()
+        {
+            if (printScreenHookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(printScreenHookHandle);
+                printScreenHookHandle = IntPtr.Zero;
+            }
+            printScreenKeyDown = false;
+            printScreenHookCallback = null;
+        }
+
+        private IntPtr PrintScreenKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && Marshal.ReadInt32(lParam) == VK_SNAPSHOT)
+            {
+                var message = wParam.ToInt32();
+                if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
+                {
+                    if (printScreenKeyDown) return new IntPtr(1);
+
+                    if (AreHotkeyModifiersDown(selectedHotkeyModifiers))
+                    {
+                        printScreenKeyDown = true;
+                        try
+                        {
+                            BeginInvoke(new Action(() =>
+                            {
+                                if (isClicking) StopAutoClicker(); else StartAutoClicker();
+                            }));
+                        }
+                        catch { }
+                        return new IntPtr(1);
+                    }
+                }
+                else if ((message == WM_KEYUP || message == WM_SYSKEYUP) && printScreenKeyDown)
+                {
+                    printScreenKeyDown = false;
+                    return new IntPtr(1);
+                }
+            }
+
+            return CallNextHookEx(printScreenHookHandle, nCode, wParam, lParam);
+        }
+
+        private bool AreHotkeyModifiersDown(uint modifiers)
+        {
+            return IsKeyDown(0x11) == ((modifiers & MOD_CONTROL) != 0)
+                && IsKeyDown(0x10) == ((modifiers & MOD_SHIFT) != 0)
+                && IsKeyDown(0x12) == ((modifiers & MOD_ALT) != 0)
+                && IsWinKeyDown() == ((modifiers & MOD_WIN) != 0);
+        }
+
+        private static bool IsKeyDown(int virtualKey)
+        {
+            return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            TryRegisterHotkey();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            UnregisterCurrentHotkey();
+            base.OnHandleDestroyed(e);
+        }
+
+        private CancellationTokenSource StartTargetMonitor(string[] entries)
         {
             try
             {
                 StopTargetMonitor();
                 targetMonitorCts = new CancellationTokenSource();
                 var token = targetMonitorCts.Token;
+                var monitorCts = new CancellationTokenSource();
+                targetMonitorCts = monitorCts;
+                isTargetAvailable = false;
+                lblStatus.Text = "Waiting for target app...";
+                var token = monitorCts.Token;
                 targetMonitorTask = Task.Run(() =>
                 {
                     try
@@ -377,34 +625,58 @@ namespace Mentality
                                 {
                                     foreach (var p in Process.GetProcesses())
                                     {
-                                        try
+                                        using (p)
                                         {
-                                            if (!string.IsNullOrEmpty(p.ProcessName) && p.ProcessName.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0)
+                                            try
                                             {
-                                                var h = p.MainWindowHandle;
-                                                if (h != IntPtr.Zero && !IsIconic(h)) { found = true; break; }
+                                                if (!string.IsNullOrEmpty(p.ProcessName) && p.ProcessName.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                {
+                                                    var h = p.MainWindowHandle;
+                                                    if (h != IntPtr.Zero && !IsIconic(h)) { found = true; break; }
+                                                }
+                                                if (!string.IsNullOrEmpty(p.MainWindowTitle) && p.MainWindowTitle.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0)
+                                                {
+                                                    var h = p.MainWindowHandle;
+                                                    if (h != IntPtr.Zero && !IsIconic(h)) { found = true; break; }
+                                                }
                                             }
-                                            if (!string.IsNullOrEmpty(p.MainWindowTitle) && p.MainWindowTitle.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0)
-                                            {
-                                                var h = p.MainWindowHandle;
-                                                if (h != IntPtr.Zero && !IsIconic(h)) { found = true; break; }
-                                            }
+                                            catch { }
                                         }
-                                        catch { }
                                     }
                                 }
                                 catch { }
                             }
 
-                            isTargetAvailable = found;
+                            if (found != isTargetAvailable)
+                            {
+                                isTargetAvailable = found;
                             if (!found) this.Invoke(new Action(() => lblStatus.Text = "Waiting for target app..."));
                             Thread.Sleep(1000);
+                                try
+                                {
+                                    this.BeginInvoke(new Action(() =>
+                                    {
+                                        if (ReferenceEquals(targetMonitorCts, monitorCts))
+                                            lblStatus.Text = found ? "Target app available." : "Waiting for target app...";
+                                    }));
+                                }
+                                catch { }
+                            }
+                            if (token.WaitHandle.WaitOne(1000)) break;
                         }
                     }
                     catch { }
                 }, token);
+                    finally
+                    {
+                        if (ReferenceEquals(targetMonitorCts, monitorCts)) targetMonitorCts = null;
+                        monitorCts.Dispose();
+                    }
+                });
+                return monitorCts;
             }
             catch { }
+            catch { return null; }
         }
 
         private void StopTargetMonitor()
@@ -416,8 +688,15 @@ namespace Mentality
                     targetMonitorCts.Cancel();
                     targetMonitorCts = null;
                 }
-            }
+            StopTargetMonitor(targetMonitorCts);
+        }
             catch { }
+
+        private void StopTargetMonitor(CancellationTokenSource monitorCts)
+        {
+            if (monitorCts == null) return;
+            try { monitorCts.Cancel(); } catch { }
+            if (ReferenceEquals(targetMonitorCts, monitorCts)) targetMonitorCts = null;
         }
 
         private string Prompt(string title, string promptText, string defaultValue)
@@ -479,6 +758,9 @@ namespace Mentality
         {
             try
             {
+                try { Migrate.UpgradeUserSettings(); }
+                catch (Exception ex) { LogError(ex); }
+
                 // load hotkey
                 try
                 {
@@ -495,6 +777,7 @@ namespace Mentality
                             if ((selectedHotkeyModifiers & MOD_SHIFT) != 0) parts.Add("Shift");
                             if ((selectedHotkeyModifiers & MOD_ALT) != 0) parts.Add("Alt");
                             // Win not shown in capture name
+                            if ((selectedHotkeyModifiers & MOD_WIN) != 0) parts.Add("Win");
                             parts.Add(selectedHotkey.ToString());
                             txtHotkey.Text = string.Join("+", parts);
                         }
@@ -531,6 +814,167 @@ namespace Mentality
             catch { }
         }
 
+        private string GetMouseClickTypeName()
+        {
+            switch (cmbClickType.SelectedIndex)
+            {
+                case 1: return "DoubleLeft";
+                case 2: return "Right";
+                case 3: return "Middle";
+                default: return "Left";
+            }
+        }
+
+        private static Version GetCurrentVersion()
+        {
+            var version = typeof(Form1).Assembly.GetName().Version;
+            return new Version(version.Major, version.Minor, Math.Max(0, version.Build));
+        }
+
+        private async void CheckForUpdatesClicked(object sender, EventArgs e)
+        {
+            btnCheckUpdates.Enabled = false;
+            btnInstallUpdate.Enabled = false;
+            lblUpdateStatus.Text = "Checking for updates...";
+
+            try
+            {
+                availableUpdate = await Migrate.CheckForUpdateAsync(GetCurrentVersion());
+                if (availableUpdate == null)
+                {
+                    lblUpdateStatus.Text = "You are using the latest version.";
+                }
+                else
+                {
+                    lblUpdateStatus.Text = $"Version {availableUpdate.Version} is available.";
+                    btnInstallUpdate.Enabled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                availableUpdate = null;
+                lblUpdateStatus.Text = "Update check failed. Check your internet connection.";
+                LogError(ex);
+            }
+            finally
+            {
+                btnCheckUpdates.Enabled = true;
+            }
+        }
+
+        private async void InstallUpdateClicked(object sender, EventArgs e)
+        {
+            if (availableUpdate == null) return;
+            if (MessageBox.Show(this, $"Download and install Mentality {availableUpdate.Version}? The app will restart.", "Install update", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            btnCheckUpdates.Enabled = false;
+            btnInstallUpdate.Enabled = false;
+            try
+            {
+                var progress = new Progress<string>(message => lblUpdateStatus.Text = message);
+                var packagePath = await Migrate.DownloadUpdateAsync(availableUpdate, progress);
+                Migrate.StartInstall(packagePath, Application.ExecutablePath, Process.GetCurrentProcess().Id);
+                Close();
+            }
+            catch (Exception ex)
+            {
+                lblUpdateStatus.Text = "Installation failed. See the error log for details.";
+                btnCheckUpdates.Enabled = true;
+                btnInstallUpdate.Enabled = true;
+                LogError(ex);
+                MessageBox.Show(this, ex.Message, "Update failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ExportDataClicked(object sender, EventArgs e)
+        {
+            using (var dialog = new SaveFileDialog
+            {
+                AddExtension = true,
+                DefaultExt = "mentalitydata",
+                FileName = "Mentality_backup.mentalitydata",
+                Filter = "Mentality data files (*.mentalitydata)|*.mentalitydata",
+                OverwritePrompt = true
+            })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    var data = new MentalityData
+                    {
+                        HotkeyKey = selectedHotkey == Keys.None ? string.Empty : selectedHotkey.ToString(),
+                        HotkeyModifiers = (int)selectedHotkeyModifiers,
+                        CurrentSettings = CaptureCurrentSettings("Current settings"),
+                        Profiles = new System.Collections.Generic.List<Profile>(profiles)
+                    };
+                    MentalityDataManager.Export(dialog.FileName, data);
+                    lblStatus.Text = "Data exported successfully.";
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex);
+                    MessageBox.Show(this, ex.Message, "Export failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        private void ImportDataClicked(object sender, EventArgs e)
+        {
+            using (var dialog = new OpenFileDialog
+            {
+                CheckFileExists = true,
+                Filter = "Mentality data files (*.mentalitydata)|*.mentalitydata",
+                Multiselect = false
+            })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    var data = MentalityDataManager.Import(dialog.FileName);
+                    if (MessageBox.Show(this, "Importing will replace your current profiles and settings. Continue?", "Import Mentality data", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
+                    var previousProfiles = profiles;
+                    var previousHotkey = Properties.Settings.Default.HotkeyKey;
+                    var previousModifiers = Properties.Settings.Default.HotkeyModifiers;
+                    var settingsChanged = false;
+                    try
+                    {
+                        Properties.Settings.Default.HotkeyKey = data.HotkeyKey ?? string.Empty;
+                        Properties.Settings.Default.HotkeyModifiers = data.HotkeyModifiers;
+                        Properties.Settings.Default.Save();
+                        settingsChanged = true;
+
+                        if (!ProfilesManager.SaveProfiles(data.Profiles)) throw new IOException("Could not save the imported profiles.");
+
+                        profiles = data.Profiles;
+                        data.CurrentSettings.HotkeyKey = data.HotkeyKey ?? string.Empty;
+                        data.CurrentSettings.HotkeyModifiers = data.HotkeyModifiers;
+                        ApplyProfile(data.CurrentSettings);
+                        RefreshProfilesCombo();
+                        lblStatus.Text = "Data imported successfully.";
+                    }
+                    catch
+                    {
+                        if (settingsChanged)
+                        {
+                            Properties.Settings.Default.HotkeyKey = previousHotkey;
+                            Properties.Settings.Default.HotkeyModifiers = previousModifiers;
+                            Properties.Settings.Default.Save();
+                        }
+                        ProfilesManager.SaveProfiles(previousProfiles);
+                        profiles = previousProfiles;
+                        RefreshProfilesCombo();
+                        throw;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex);
+                    MessageBox.Show(this, ex.Message, "Import failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
         private void ApplyProfile(Profile p)
         {
             try
@@ -539,16 +983,37 @@ namespace Mentality
                 nudIntervalMs.Value = Math.Min(nudIntervalMs.Maximum, Math.Max(nudIntervalMs.Minimum, p.IntervalMs));
                 rdoRightButton.Checked = p.RightButton;
                 rdoLeftButton.Checked = !p.RightButton;
+                switch (p.MouseClickType)
+                {
+                    case "DoubleLeft": cmbClickType.SelectedIndex = 1; break;
+                    case "Right": cmbClickType.SelectedIndex = 2; break;
+                    case "Middle": cmbClickType.SelectedIndex = 3; break;
+                    default: cmbClickType.SelectedIndex = p.RightButton ? 2 : 0; break;
+                }
                 nudStartDelay.Value = Math.Min(nudStartDelay.Maximum, Math.Max(nudStartDelay.Minimum, p.StartDelay));
                 chkAutoMinimize.Checked = p.AutoMinimize;
                 chkRunWhenMinimized.Checked = p.RunWhenMinimized;
                 chkUseHotkey.Checked = p.UseHotkey;
                 if (!string.IsNullOrEmpty(p.HotkeyKey) && Enum.TryParse<Keys>(p.HotkeyKey, out Keys kv)) selectedHotkey = kv;
+                else selectedHotkey = Keys.None;
                 selectedHotkeyModifiers = (uint)p.HotkeyModifiers;
+                try
+                {
+                    Properties.Settings.Default.HotkeyKey = selectedHotkey == Keys.None ? string.Empty : selectedHotkey.ToString();
+                    Properties.Settings.Default.HotkeyModifiers = (int)selectedHotkeyModifiers;
+                    Properties.Settings.Default.Save();
+                }
+                catch (Exception ex) { LogError(ex); }
                 chkLimitToSpecificWindow.Checked = p.LimitToSpecificWindow;
                 txtTargetGameWindows.Text = p.TargetWindows;
                 nudJitterPercent.Value = Math.Min(nudJitterPercent.Maximum, Math.Max(nudJitterPercent.Minimum, p.JitterPercent));
                 chkPauseOnInput.Checked = p.PauseOnUserInput;
+                chkSchedule.Checked = p.ScheduleEnabled;
+                if (p.ScheduledStartTime >= dtpStartTime.MinDate && p.ScheduledStartTime <= dtpStartTime.MaxDate)
+                    dtpStartTime.Value = p.ScheduledStartTime;
+                nudRunMinutes.Value = Math.Min(nudRunMinutes.Maximum, Math.Max(nudRunMinutes.Minimum, p.RunMinutes));
+                if (p.PauseIdleSeconds > 0)
+                    nudPauseIdleSeconds.Value = Math.Min(nudPauseIdleSeconds.Maximum, Math.Max(nudPauseIdleSeconds.Minimum, p.PauseIdleSeconds));
 
                 // update hotkey display
                 try
@@ -562,6 +1027,7 @@ namespace Mentality
                     txtHotkey.Text = string.Join("+", parts);
                 }
                 catch { }
+                TryRegisterHotkey();
             }
             catch { }
         }
@@ -579,6 +1045,7 @@ namespace Mentality
         {
             StopAutoClicker();
             try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
+            UnregisterCurrentHotkey();
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -601,6 +1068,33 @@ namespace Mentality
                 return (uint)Environment.TickCount - li.dwTime;
             }
             catch { return 0; }
+        }
+
+        private static void SendMouseClick(uint downFlag, uint upFlag)
+        {
+            mouse_event(downFlag, 0, 0, 0, UIntPtr.Zero);
+            mouse_event(upFlag, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        private static void PerformClick(int clickType)
+        {
+            switch (clickType)
+            {
+                case 1:
+                    SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                    Thread.Sleep(50);
+                    SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                    break;
+                case 2:
+                    SendMouseClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+                    break;
+                case 3:
+                    SendMouseClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+                    break;
+                default:
+                    SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                    break;
+            }
         }
 
         private void Audit(string message)
@@ -673,6 +1167,8 @@ namespace Mentality
                 GetWindowThreadProcessId(h, out pid);
                 var p = Process.GetProcessById((int)pid);
                 return p?.ProcessName ?? null;
+                using (var p = Process.GetProcessById((int)pid))
+                    return p.ProcessName;
             }
             catch { return null; }
         }
@@ -680,7 +1176,27 @@ namespace Mentality
         private void StartAutoClicker()
         {
             if (isClicking) return;
+
+            var delay = (int)nudStartDelay.Value;
+            var autoMinimize = chkAutoMinimize.Checked;
+            var runWhenMinimized = chkRunWhenMinimized.Checked;
+            var pauseOnInput = chkPauseOnInput.Checked;
+            var pauseIdleSeconds = (int)nudPauseIdleSeconds.Value;
+            var limitToSpecificWindow = chkLimitToSpecificWindow.Checked;
+            var targetWindows = txtTargetGameWindows.Text.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < targetWindows.Length; i++) targetWindows[i] = targetWindows[i].Trim().ToLowerInvariant();
+            var clickType = cmbClickType.SelectedIndex;
+            var jitterPercent = (int)nudJitterPercent.Value;
+            DateTime? scheduledStart = null;
+            DateTime? scheduledEnd = null;
+            if (chkSchedule.Checked)
+            {
+                scheduledStart = dtpStartTime.Value;
+                if (nudRunMinutes.Value > 0) scheduledEnd = scheduledStart.Value.AddMinutes((double)nudRunMinutes.Value);
+            }
+
             isClicking = true;
+            var generation = ++autoClickerGeneration;
             btnStartClicker.Enabled = false;
             btnStopClicker.Enabled = true;
             progressBar.Visible = true;
@@ -732,26 +1248,37 @@ namespace Mentality
                     scheduledEnd = scheduledStart.Value.AddMinutes((double)nudRunMinutes.Value);
                 }
             }
+            var clickerCts = autoClickerCts;
+            var token = clickerCts.Token;
 
             // start target monitor if targeting specific apps
             try { if (chkLimitToSpecificWindow != null && chkLimitToSpecificWindow.Checked) StartTargetMonitor(); } catch { }
+            var monitorCts = limitToSpecificWindow ? StartTargetMonitor(targetWindows) : null;
 
             autoClickerTask = Task.Run(() =>
             {
+                var jitterRandom = new Random();
                 try
                 {
                     // wait until scheduled start if needed
+                    // wait until scheduled start if needed (cancellable; safe for long waits)
                     if (scheduledStart.HasValue && scheduledStart.Value > DateTime.Now)
                     {
                         var waitMs = (int)(scheduledStart.Value - DateTime.Now).TotalMilliseconds;
                         if (waitMs > 0)
+                        var scheduledWait = scheduledStart.Value - DateTime.Now;
+                        if (scheduledWait > TimeSpan.Zero)
                         {
                             this.Invoke(new Action(() => lblStatus.Text = $"Waiting to start at {scheduledStart.Value}"));
                             var waited = 0;
                             while (waited < waitMs && !token.IsCancellationRequested)
+                            while (scheduledWait > TimeSpan.Zero && !token.IsCancellationRequested)
                             {
                                 Thread.Sleep(Math.Min(1000, waitMs - waited));
                                 waited += Math.Min(1000, waitMs - waited);
+                                var waitMilliseconds = (int)Math.Min(1000, scheduledWait.TotalMilliseconds);
+                                if (token.WaitHandle.WaitOne(waitMilliseconds)) break;
+                                scheduledWait = scheduledStart.Value - DateTime.Now;
                             }
                         }
                     }
@@ -759,14 +1286,17 @@ namespace Mentality
                     // optional start delay
                     int delay = 0;
                     try { this.Invoke(new Action(() => delay = (int)nudStartDelay.Value)); } catch { }
+                    // optional start delay (cancellable)
                     for (int i = 0; i < delay && !token.IsCancellationRequested; i++)
                     {
                         this.Invoke(new Action(() => lblStatus.Text = $"Starting in {delay - i}...") );
                         Thread.Sleep(1000);
+                        if (token.WaitHandle.WaitOne(1000)) break;
                     }
 
                     // auto-minimize
                     if (chkAutoMinimize.Checked)
+                    if (autoMinimize)
                     {
                         try { this.Invoke(new Action(() => this.WindowState = FormWindowState.Minimized)); } catch { }
                     }
@@ -781,8 +1311,20 @@ namespace Mentality
                         }
 
                         bool doClick = true;
+                        int interval = 10;
+                        bool windowIsMinimized = false;
+                        try
+                        {
+                            this.Invoke(new Action(() =>
+                            {
+                                interval = (int)nudIntervalMs.Value;
+                                windowIsMinimized = this.WindowState == FormWindowState.Minimized;
+                            }));
+                        }
+                        catch { }
 
                         if (!chkRunWhenMinimized.Checked && this.WindowState == FormWindowState.Minimized)
+                        if (!runWhenMinimized && windowIsMinimized)
                         {
                             doClick = false;
                         }
@@ -791,9 +1333,11 @@ namespace Mentality
                         try
                         {
                             if (chkPauseOnInput != null && chkPauseOnInput.Checked)
+                            if (pauseOnInput)
                             {
                                 var idleMs = GetIdleTimeMs();
                                 var threshold = (int)(nudPauseIdleSeconds?.Value ?? 3) * 1000;
+                                var threshold = pauseIdleSeconds * 1000;
                                 if (idleMs < (uint)threshold) doClick = false;
                             }
                         }
@@ -804,29 +1348,34 @@ namespace Mentality
                             var allowed = txtTargetGameWindows.Text.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
                             for (int i = 0; i < allowed.Length; i++) allowed[i] = allowed[i].Trim().ToLowerInvariant();
                             if (allowed.Length > 0)
-                            {
-                                var fg = GetForegroundProcessName();
+                        if (doClick && limitToSpecificWindow && targetWindows.Length > 0)
+                        {
+                            var fg = GetForegroundProcessName();
                                 if (string.IsNullOrEmpty(fg) || Array.IndexOf(allowed, fg.ToLowerInvariant()) < 0)
+                            var foreground = (fg ?? string.Empty).ToLowerInvariant();
+                            if (foreground.Length == 0 || Array.IndexOf(targetWindows, foreground) < 0)
+                            {
+                                // also try window title match
+                                var h = GetForegroundWindow();
+                                string title = null;
+                                try
                                 {
-                                    // also try window title match
-                                    var h = GetForegroundWindow();
-                                    string title = null;
-                                    try
-                                    {
-                                        var sb = new System.Text.StringBuilder(256);
-                                        GetWindowText(h, sb, sb.Capacity);
-                                        title = sb.ToString().ToLowerInvariant();
-                                    }
-                                    catch { }
-                                    bool match = false;
-                                    for (int i = 0; i < allowed.Length && !match; i++)
-                                    {
-                                        if (!string.IsNullOrEmpty(allowed[i]) && (fg.ToLowerInvariant().Contains(allowed[i]) || (!string.IsNullOrEmpty(title) && title.Contains(allowed[i]))))
-                                            match = true;
-                                    }
-                                    if (!match) doClick = false;
+                                    var sb = new System.Text.StringBuilder(256);
+                                    GetWindowText(h, sb, sb.Capacity);
+                                    title = sb.ToString().ToLowerInvariant();
                                 }
+                                catch { }
+                                bool match = false;
+                                    for (int i = 0; i < allowed.Length && !match; i++)
+                                for (int i = 0; i < targetWindows.Length && !match; i++)
+                                {
+                                        if (!string.IsNullOrEmpty(allowed[i]) && (fg.ToLowerInvariant().Contains(allowed[i]) || (!string.IsNullOrEmpty(title) && title.Contains(allowed[i]))))
+                                    if (!string.IsNullOrEmpty(targetWindows[i]) && (foreground.Contains(targetWindows[i]) || (!string.IsNullOrEmpty(title) && title.Contains(targetWindows[i]))))
+                                        match = true;
+                                }
+                                if (!match) doClick = false;
                             }
+                        }
                         }
 
                         if (doClick)
@@ -841,6 +1390,7 @@ namespace Mentality
                                 mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
                                 mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
                             }
+                            PerformClick(clickType);
                         }
 
                         int interval = 10;
@@ -851,33 +1401,54 @@ namespace Mentality
                         {
                             var jitter = (int)(nudJitterPercent?.Value ?? 0);
                             if (jitter > 0 && interval > 0)
+                            if (jitterPercent > 0 && interval > 0)
                             {
                                 var maxOffset = Math.Max(0, (int)(interval * jitter / 100.0));
                                 var offset = rng.Next(-maxOffset, maxOffset + 1);
+                                var maxOffset = Math.Max(0, (int)(interval * jitterPercent / 100.0));
+                                var offset = jitterRandom.Next(-maxOffset, maxOffset + 1);
                                 interval = Math.Max(1, interval + offset);
                             }
                         }
                         catch { }
 
                         if (interval > 0) Thread.Sleep(interval); else Thread.Sleep(0);
+                        if (interval > 0) token.WaitHandle.WaitOne(interval);
+                        else Thread.Yield();
                     }
                 }
                 catch (Exception ex)
                 {
                     LogError(ex);
                     this.Invoke(new Action(() => lblStatus.Text = "Error during autoclick."));
+                    try
+                    {
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            if (generation == autoClickerGeneration) lblStatus.Text = "Error during autoclick.";
+                        }));
+                    }
+                    catch { }
                 }
                 finally
                 {
                     // ensure UI state reset
                     this.Invoke(new Action(() =>
+                    StopTargetMonitor(monitorCts);
+                    clickerCts.Dispose();
+                    try
                     {
-                        isClicking = false;
-                        btnStartClicker.Enabled = true;
-                        btnStopClicker.Enabled = false;
-                        progressBar.Visible = false;
-                    }));
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            if (generation != autoClickerGeneration) return;
+                            isClicking = false;
+                            btnStartClicker.Enabled = true;
+                            btnStopClicker.Enabled = false;
+                            progressBar.Visible = false;
+                        }));
                     try { StopTargetMonitor(); } catch { }
+                    }
+                    catch { }
                 }
             }, token);
         }
@@ -893,14 +1464,18 @@ namespace Mentality
             catch { }
             finally
             {
-                isClicking = false;
-                btnStartClicker.Enabled = true;
-                btnStopClicker.Enabled = false;
-                progressBar.Visible = false;
-                lblStatus.Text = "Stopped.";
+            autoClickerGeneration++;
+            try { autoClickerCts?.Cancel(); } catch { }
+            autoClickerCts = null;
+            isClicking = false;
+            btnStartClicker.Enabled = true;
+            btnStopClicker.Enabled = false;
+            progressBar.Visible = false;
+            lblStatus.Text = "Stopped.";
                 try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
                 try { StopTargetMonitor(); } catch { }
             }
+            StopTargetMonitor();
         }
 
         private void LogError(Exception ex)

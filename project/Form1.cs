@@ -9,6 +9,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Diagnostics;
+using Microsoft.Win32;
+using System.ComponentModel;
+using System.Security.Principal;
 
 namespace Mentality
 {
@@ -63,6 +66,26 @@ namespace Mentality
         private Panel pnlMiscContent;
         private Button btnExportData;
         private Button btnImportData;
+        private Button btnOtherStuffToggle;
+        private Panel pnlOtherStuff;
+        private bool otherStuffExpanded;
+        private CheckBox chkAlwaysActive;
+        private TextBox txtShowAppHotkey;
+        private CheckBox chkKeepOnTop;
+        private Button btnBackgroundColor;
+        private CheckBox chkRainbowTap;
+        private Label lblClickCount;
+        private Button btnResetClickCount;
+        private Button btnDesktopShortcut;
+        private Button btnStartMenuShortcut;
+        private Button btnRemoveDesktopShortcut;
+        private Button btnRemoveStartMenuShortcut;
+        private Button btnTaskbarShortcut;
+        private CheckBox chkAutoCreateDesktopShortcut;
+        private CheckBox chkAutoCreateStartMenuShortcut;
+        private Button btnOpenDataFolder;
+        private Label lblAdminStatus;
+        private Button btnRestartAsAdmin;
         private bool miscExpanded;
         private UpdateInfo availableUpdate;
 
@@ -79,6 +102,23 @@ namespace Mentality
         private LowLevelKeyboardProc printScreenHookCallback;
         private bool printScreenKeyDown;
         private int autoClickerGeneration;
+        private bool startInTray;
+        private bool exitRequested;
+        private NotifyIcon trayIcon;
+        private NotifyIcon updateNotifyIcon;
+        private bool showAppHotkeyRegistered;
+        private Keys showAppHotkey = Keys.None;
+        private uint showAppHotkeyModifiers;
+        private System.Windows.Forms.Timer rainbowTimer;
+        private System.Windows.Forms.Timer clickCountTimer;
+        private System.Windows.Forms.Timer updateReminderTimer;
+        private int rainbowHue;
+        private int clickCount;
+        private Color originalStatusForeColor;
+        private bool updatingAlwaysActive;
+        private bool printScreenCaptureMode;
+        private bool updateCheckInProgress;
+        private uint pendingPrintScreenModifiers;
 
         // target monitoring
         private Task targetMonitorTask;
@@ -95,6 +135,7 @@ namespace Mentality
 
         private const int WM_HOTKEY = 0x0312;
         private const int HOTKEY_ID = 0x9000;
+        private const int SHOW_APP_HOTKEY_ID = 0x9001;
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_KEYUP = 0x0101;
@@ -144,11 +185,14 @@ namespace Mentality
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         public Form1()
+        public Form1(bool startInTray = false)
         {
+            this.startInTray = startInTray;
             InitializeComponent();
             BuildUi();
             LoadState();
             this.FormClosing += Form1_FormClosing;
+            this.Shown += Form1_Shown;
         }
 
         // Minimal InitializeComponent to satisfy WinForms designer expectations
@@ -164,7 +208,7 @@ namespace Mentality
         private void BuildUi()
         {
             this.Text = "Mentality v1.2.1";
-            this.Text = "Mentality v1.3.3";
+            this.Text = "Mentality v1.3.5.1";
             this.Size = new Size(900, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.Sizable;
@@ -177,6 +221,7 @@ namespace Mentality
             mainPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
 
             lblStatus = new Label { Text = "Ready", Location = new Point(8, 8), Size = new Size(820, 24), Font = new Font("Segoe UI", 10F) };
+            originalStatusForeColor = lblStatus.ForeColor;
             progressBar = new ProgressBar { Location = new Point(8, 36), Size = new Size(820, 16), Visible = false };
 
             int y = 64;
@@ -215,6 +260,7 @@ namespace Mentality
             lblHotkeyHint = new Label { Text = "Click to set a global hotkey (e.g., Win+F5).", Location = new Point(360, y), Size = new Size(400, 22), ForeColor = Color.Gray };
             // Click to begin capture; then press a key combination (e.g., Ctrl+Shift+A)
             txtHotkey.Click += (s, e) => { try { txtHotkey.ReadOnly = false; txtHotkey.Text = "Press combination..."; txtHotkey.Focus(); } catch { } };
+            txtHotkey.Click += (s, e) => BeginHotkeyCapture();
             txtHotkey.KeyDown += (s, e) =>
             {
                 try
@@ -243,6 +289,7 @@ namespace Mentality
 
                     selectedHotkeyModifiers = mods;
                     selectedHotkey = key;
+                    printScreenCaptureMode = false;
 
                     var names = new System.Collections.Generic.List<string>();
                     if ((mods & MOD_CONTROL) != 0) names.Add("Ctrl");
@@ -262,6 +309,7 @@ namespace Mentality
                                             // attempt to register immediately
                                             TryRegisterHotkey();
                                         }
+
                                         catch { }
                                     }
                                     catch { }
@@ -313,17 +361,31 @@ namespace Mentality
             var grpMisc = new GroupBox { Text = "Misc (advanced)", Location = new Point(8, y+92), Size = new Size(760, 180) };
             // Misc accordion
             btnMiscToggle = new Button { Text = "Misc (advanced)   ▶", Location = new Point(8, y+92), Size = new Size(760, 30), TextAlign = ContentAlignment.MiddleLeft, FlatStyle = FlatStyle.Flat };
-            pnlMiscContent = new Panel { Location = new Point(8, y+122), Size = new Size(760, 220), BorderStyle = BorderStyle.FixedSingle, Visible = false };
+            pnlMiscContent = new Panel { Location = new Point(8, y+122), Size = new Size(760, 252), BorderStyle = BorderStyle.FixedSingle, Visible = false, AutoScroll = true };
             mainPanel.AutoScrollMinSize = new Size(0, btnMiscToggle.Bottom + 8);
             btnMiscToggle.Click += (s, e) =>
             {
+                if (miscExpanded && otherStuffExpanded)
+                {
+                    otherStuffExpanded = false;
+                    pnlOtherStuff.Visible = false;
+                    btnOtherStuffToggle.Text = "Other stuff   ▶";
+                    pnlMiscContent.Height = btnOtherStuffToggle.Bottom + 8;
+                }
                 miscExpanded = !miscExpanded;
                 pnlMiscContent.Visible = miscExpanded;
                 btnMiscToggle.Text = miscExpanded ? "Misc (advanced)   ▼" : "Misc (advanced)   ▶";
-                mainPanel.AutoScrollMinSize = new Size(0, (miscExpanded ? pnlMiscContent.Bottom : btnMiscToggle.Bottom) + 8);
+                mainPanel.AutoScrollMinSize = new Size(0, (miscExpanded ? pnlMiscContent.Bottom + 48 : btnMiscToggle.Bottom + 8));
                 mainPanel.PerformLayout();
-                if (miscExpanded) mainPanel.ScrollControlIntoView(pnlMiscContent);
-                else mainPanel.ScrollControlIntoView(btnMiscToggle);
+                if (miscExpanded)
+                {
+                    var scrollBottom = Math.Max(0, mainPanel.AutoScrollMinSize.Height - mainPanel.ClientSize.Height);
+                    mainPanel.AutoScrollPosition = new Point(0, scrollBottom);
+                }
+                else
+                {
+                    mainPanel.ScrollControlIntoView(btnMiscToggle);
+                }
             };
 
             chkSchedule = new CheckBox { Text = "Schedule start", Location = new Point(12, 20), Size = new Size(120, 22) };
@@ -352,7 +414,52 @@ namespace Mentality
             btnImportData = new Button { Text = "Import data...", Location = new Point(144, 178), Size = new Size(120, 28) };
             btnImportData.Click += ImportDataClicked;
 
-            pnlMiscContent.Controls.AddRange(new Control[] { chkSchedule, dtpStartTime, nudRunMinutes, lblRunMinutes, nudJitterPercent, lblJitter, chkPauseOnInput, nudPauseIdleSeconds, lblPauseHint, lblTargetNote, btnCheckUpdates, btnInstallUpdate, lblUpdateStatus, btnExportData, btnImportData });
+            btnOtherStuffToggle = new Button { Text = "Other stuff   ▶", Location = new Point(12, 216), Size = new Size(720, 28), TextAlign = ContentAlignment.MiddleLeft, FlatStyle = FlatStyle.Flat };
+            pnlOtherStuff = new Panel { Location = new Point(12, 250), Size = new Size(720, 460), BorderStyle = BorderStyle.FixedSingle, Visible = false, AutoScroll = true };
+            chkAlwaysActive = new CheckBox { Text = "Always Active (start with Windows; keep in tray)", Location = new Point(12, 10), Size = new Size(330, 24), Checked = Properties.Settings.Default.AlwaysActive };
+            chkAlwaysActive.CheckedChanged += AlwaysActiveChanged;
+            txtShowAppHotkey = new TextBox { Location = new Point(12, 46), Size = new Size(220, 24), ReadOnly = true, Text = FormatShowAppHotkey() };
+            txtShowAppHotkey.Click += (s, e) => { txtShowAppHotkey.ReadOnly = false; txtShowAppHotkey.Text = "Press combination..."; txtShowAppHotkey.Focus(); };
+            txtShowAppHotkey.KeyDown += ShowAppHotkeyKeyDown;
+            var lblShowAppHotkey = new Label { Text = "Hotkey to show app:", Location = new Point(244, 49), Size = new Size(180, 22) };
+            chkKeepOnTop = new CheckBox { Text = "Keep window on top", Location = new Point(12, 82), Size = new Size(200, 24), Checked = Properties.Settings.Default.KeepOnTop };
+            chkKeepOnTop.CheckedChanged += KeepOnTopChanged;
+            this.TopMost = chkKeepOnTop.Checked;
+            btnBackgroundColor = new Button { Text = "Choose background color...", Location = new Point(12, 116), Size = new Size(200, 28) };
+            btnBackgroundColor.Click += ChooseBackgroundColorClicked;
+            chkRainbowTap = new CheckBox { Text = "Rainbow tap effect", Location = new Point(236, 118), Size = new Size(200, 24), Checked = Properties.Settings.Default.RainbowTap };
+            chkRainbowTap.CheckedChanged += RainbowTapChanged;
+            rainbowTimer = new System.Windows.Forms.Timer { Interval = 80 };
+            rainbowTimer.Tick += RainbowTimerTick;
+            lblClickCount = new Label { Text = "Clicks this session: 0", Location = new Point(12, 154), Size = new Size(190, 22) };
+            btnResetClickCount = new Button { Text = "Reset count", Location = new Point(208, 150), Size = new Size(110, 28) };
+            btnResetClickCount.Click += ResetClickCountClicked;
+            clickCountTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            clickCountTimer.Tick += (s, e) => lblClickCount.Text = "Clicks this session: " + Interlocked.CompareExchange(ref clickCount, 0, 0);
+            clickCountTimer.Start();
+            btnDesktopShortcut = new Button { Text = "Create Desktop shortcut", Location = new Point(12, 188), Size = new Size(180, 28) };
+            btnDesktopShortcut.Click += (s, e) => CreateShortcutClicked(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), true);
+            btnStartMenuShortcut = new Button { Text = "Create Start Menu shortcut", Location = new Point(200, 188), Size = new Size(200, 28) };
+            btnStartMenuShortcut.Click += (s, e) => CreateShortcutClicked(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs", "Mentality"), true);
+            btnRemoveDesktopShortcut = new Button { Text = "Remove Desktop shortcut", Location = new Point(12, 222), Size = new Size(180, 28) };
+            btnRemoveDesktopShortcut.Click += (s, e) => RemoveShortcutClicked(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Desktop");
+            btnRemoveStartMenuShortcut = new Button { Text = "Remove Start Menu shortcut", Location = new Point(200, 222), Size = new Size(200, 28) };
+            btnRemoveStartMenuShortcut.Click += (s, e) => RemoveShortcutClicked(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs", "Mentality"), "Start Menu");
+            btnTaskbarShortcut = new Button { Text = "Pin / unpin taskbar", Location = new Point(408, 222), Size = new Size(180, 28) };
+            btnTaskbarShortcut.Click += TaskbarShortcutClicked;
+            btnOpenDataFolder = new Button { Text = "Open app data folder", Location = new Point(12, 258), Size = new Size(180, 28) };
+            btnOpenDataFolder.Click += OpenDataFolderClicked;
+            lblAdminStatus = new Label { Text = IsRunningAsAdministrator() ? "Running as Administrator" : "Running as a standard user", Location = new Point(12, 296), Size = new Size(260, 22) };
+            btnRestartAsAdmin = new Button { Text = "Restart as Administrator...", Location = new Point(12, 324), Size = new Size(200, 28) };
+            btnRestartAsAdmin.Click += RestartAsAdministratorClicked;
+            chkAutoCreateDesktopShortcut = new CheckBox { Text = "Automatically create Desktop shortcut if missing", Location = new Point(236, 328), Size = new Size(340, 22), Checked = Properties.Settings.Default.AutoCreateDesktopShortcut };
+            chkAutoCreateDesktopShortcut.CheckedChanged += (s, e) => { Properties.Settings.Default.AutoCreateDesktopShortcut = chkAutoCreateDesktopShortcut.Checked; Properties.Settings.Default.Save(); };
+            chkAutoCreateStartMenuShortcut = new CheckBox { Text = "Automatically create Start Menu shortcut if missing", Location = new Point(236, 354), Size = new Size(370, 22), Checked = Properties.Settings.Default.AutoCreateStartMenuShortcut };
+            chkAutoCreateStartMenuShortcut.CheckedChanged += (s, e) => { Properties.Settings.Default.AutoCreateStartMenuShortcut = chkAutoCreateStartMenuShortcut.Checked; Properties.Settings.Default.Save(); };
+            pnlOtherStuff.Controls.AddRange(new Control[] { chkAlwaysActive, txtShowAppHotkey, lblShowAppHotkey, chkKeepOnTop, btnBackgroundColor, chkRainbowTap, lblClickCount, btnResetClickCount, btnDesktopShortcut, btnStartMenuShortcut, btnRemoveDesktopShortcut, btnRemoveStartMenuShortcut, btnTaskbarShortcut, btnOpenDataFolder, lblAdminStatus, btnRestartAsAdmin, chkAutoCreateDesktopShortcut, chkAutoCreateStartMenuShortcut });
+            btnOtherStuffToggle.Click += OtherStuffToggleClicked;
+
+            pnlMiscContent.Controls.AddRange(new Control[] { chkSchedule, dtpStartTime, nudRunMinutes, lblRunMinutes, nudJitterPercent, lblJitter, chkPauseOnInput, nudPauseIdleSeconds, lblPauseHint, lblTargetNote, btnCheckUpdates, btnInstallUpdate, lblUpdateStatus, btnExportData, btnImportData, btnOtherStuffToggle, pnlOtherStuff });
 
 
             mainPanel.Controls.Add(lblStatus);
@@ -392,6 +499,446 @@ namespace Mentality
 
             this.Controls.Add(sep);
             this.Controls.Add(mainPanel);
+        }
+
+        private void OtherStuffToggleClicked(object sender, EventArgs e)
+        {
+            otherStuffExpanded = !otherStuffExpanded;
+            pnlOtherStuff.Visible = otherStuffExpanded;
+            btnOtherStuffToggle.Text = otherStuffExpanded ? "Other stuff   ▼" : "Other stuff   ▶";
+            pnlMiscContent.Height = otherStuffExpanded ? pnlOtherStuff.Bottom + 8 : btnOtherStuffToggle.Bottom + 8;
+
+            if (!miscExpanded) return;
+
+            mainPanel.AutoScrollMinSize = new Size(0, pnlMiscContent.Bottom + 48);
+            mainPanel.PerformLayout();
+            var scrollBottom = Math.Max(0, mainPanel.AutoScrollMinSize.Height - mainPanel.ClientSize.Height);
+            mainPanel.AutoScrollPosition = new Point(0, scrollBottom);
+        }
+
+        private void ShowAppHotkeyKeyDown(object sender, KeyEventArgs e)
+        {
+            e.SuppressKeyPress = true;
+            if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.Delete || e.KeyCode == Keys.Back)
+            {
+                showAppHotkey = Keys.None;
+                showAppHotkeyModifiers = 0;
+                txtShowAppHotkey.Text = string.Empty;
+                txtShowAppHotkey.ReadOnly = true;
+                Properties.Settings.Default.ShowAppHotkeyKey = string.Empty;
+                Properties.Settings.Default.ShowAppHotkeyModifiers = 0;
+                Properties.Settings.Default.Save();
+                TryRegisterShowAppHotkey();
+                return;
+            }
+
+            var key = e.KeyCode;
+            if (key == Keys.ControlKey || key == Keys.ShiftKey || key == Keys.Menu || key == Keys.LWin || key == Keys.RWin)
+            {
+                var modifiersOnly = new System.Collections.Generic.List<string>();
+                if (e.Control) modifiersOnly.Add("Ctrl");
+                if (e.Shift) modifiersOnly.Add("Shift");
+                if (e.Alt) modifiersOnly.Add("Alt");
+                if (IsWinKeyDown()) modifiersOnly.Add("Win");
+                txtShowAppHotkey.Text = string.Join("+", modifiersOnly);
+                return;
+            }
+
+            uint modifiers = 0;
+            if (e.Control) modifiers |= MOD_CONTROL;
+            if (e.Shift) modifiers |= MOD_SHIFT;
+            if (e.Alt) modifiers |= MOD_ALT;
+            if (IsWinKeyDown()) modifiers |= MOD_WIN;
+            if (key == Keys.PrintScreen || (chkUseHotkey.Checked && key == selectedHotkey && modifiers == selectedHotkeyModifiers))
+            {
+                lblStatus.Text = "Choose a different key combination for the show-app hotkey.";
+                txtShowAppHotkey.Text = FormatShowAppHotkey();
+                txtShowAppHotkey.ReadOnly = true;
+                return;
+            }
+
+            showAppHotkey = key;
+            showAppHotkeyModifiers = modifiers;
+            txtShowAppHotkey.Text = FormatShowAppHotkey();
+            txtShowAppHotkey.ReadOnly = true;
+            Properties.Settings.Default.ShowAppHotkeyKey = showAppHotkey.ToString();
+            Properties.Settings.Default.ShowAppHotkeyModifiers = (int)showAppHotkeyModifiers;
+            Properties.Settings.Default.Save();
+            TryRegisterShowAppHotkey();
+        }
+
+        private string FormatShowAppHotkey()
+        {
+            var keyName = Properties.Settings.Default.ShowAppHotkeyKey;
+            Keys key;
+            if (string.IsNullOrWhiteSpace(keyName) || !Enum.TryParse(keyName, out key) || key == Keys.None) return string.Empty;
+
+            var modifiers = (uint)Properties.Settings.Default.ShowAppHotkeyModifiers;
+            var parts = new System.Collections.Generic.List<string>();
+            if ((modifiers & MOD_CONTROL) != 0) parts.Add("Ctrl");
+            if ((modifiers & MOD_SHIFT) != 0) parts.Add("Shift");
+            if ((modifiers & MOD_ALT) != 0) parts.Add("Alt");
+            if ((modifiers & MOD_WIN) != 0) parts.Add("Win");
+            parts.Add(key.ToString());
+            return string.Join("+", parts);
+        }
+
+        private void TryRegisterShowAppHotkey()
+        {
+            if (!IsHandleCreated) return;
+            UnregisterShowAppHotkey();
+            if (showAppHotkey == Keys.None) return;
+
+            if (chkUseHotkey.Checked && showAppHotkey == selectedHotkey && showAppHotkeyModifiers == selectedHotkeyModifiers)
+            {
+                lblStatus.Text = "The show-app hotkey conflicts with the clicker hotkey.";
+                return;
+            }
+
+            if (RegisterHotKey(this.Handle, SHOW_APP_HOTKEY_ID, showAppHotkeyModifiers, (uint)showAppHotkey))
+            {
+                showAppHotkeyRegistered = true;
+                return;
+            }
+
+            var error = Marshal.GetLastWin32Error();
+            lblStatus.Text = "Could not register the show-app hotkey (error " + error + ").";
+            HotkeyLog("Show-app RegisterHotKey failed err=" + error);
+        }
+
+        private void UnregisterShowAppHotkey()
+        {
+            if (!showAppHotkeyRegistered || !IsHandleCreated)
+            {
+                showAppHotkeyRegistered = false;
+                return;
+            }
+
+            try { UnregisterHotKey(this.Handle, SHOW_APP_HOTKEY_ID); }
+            catch { }
+            finally { showAppHotkeyRegistered = false; }
+        }
+
+        private void KeepOnTopChanged(object sender, EventArgs e)
+        {
+            this.TopMost = chkKeepOnTop.Checked;
+            Properties.Settings.Default.KeepOnTop = chkKeepOnTop.Checked;
+            Properties.Settings.Default.Save();
+        }
+
+        private void ChooseBackgroundColorClicked(object sender, EventArgs e)
+        {
+            using (var dialog = new ColorDialog { Color = mainPanel.BackColor, FullOpen = true })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                Properties.Settings.Default.BackgroundColor = ColorTranslator.ToHtml(dialog.Color);
+                Properties.Settings.Default.Save();
+                ApplyBackgroundColor(dialog.Color);
+            }
+        }
+
+        private void ApplyBackgroundColor(Color color)
+        {
+            mainPanel.BackColor = color;
+            pnlMiscContent.BackColor = color;
+            pnlOtherStuff.BackColor = color;
+            this.BackColor = color;
+        }
+
+        private void RainbowTapChanged(object sender, EventArgs e)
+        {
+            Properties.Settings.Default.RainbowTap = chkRainbowTap.Checked;
+            Properties.Settings.Default.Save();
+            if (chkRainbowTap.Checked) rainbowTimer.Start();
+            else
+            {
+                rainbowTimer.Stop();
+                lblStatus.ForeColor = originalStatusForeColor;
+            }
+        }
+
+        private void RainbowTimerTick(object sender, EventArgs e)
+        {
+            if (!chkRainbowTap.Checked || !isClicking)
+            {
+                lblStatus.ForeColor = originalStatusForeColor;
+                return;
+            }
+
+            rainbowHue = (rainbowHue + 6) % 360;
+            lblStatus.ForeColor = ColorFromHue(rainbowHue);
+        }
+
+        private static Color ColorFromHue(int hue)
+        {
+            var chroma = 1.0;
+            var x = 1.0 - Math.Abs((hue / 60.0 % 2.0) - 1.0);
+            double red, green, blue;
+            if (hue < 60) { red = chroma; green = x; blue = 0; }
+            else if (hue < 120) { red = x; green = chroma; blue = 0; }
+            else if (hue < 180) { red = 0; green = chroma; blue = x; }
+            else if (hue < 240) { red = 0; green = x; blue = chroma; }
+            else if (hue < 300) { red = x; green = 0; blue = chroma; }
+            else { red = chroma; green = 0; blue = x; }
+            return Color.FromArgb((int)(red * 255), (int)(green * 255), (int)(blue * 255));
+        }
+
+        private void ResetClickCountClicked(object sender, EventArgs e)
+        {
+            Interlocked.Exchange(ref clickCount, 0);
+            lblClickCount.Text = "Clicks this session: 0";
+        }
+
+        private bool IsRunningAsAdministrator()
+        {
+            try
+            {
+                using (var identity = WindowsIdentity.GetCurrent())
+                    return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string DesktopShortcutPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Mentality.lnk"); }
+        }
+
+        private string StartMenuShortcutFolder
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs", "Mentality"); }
+        }
+
+        private void CreateShortcutClicked(string destinationFolder, bool manual)
+        {
+            var shortcutPath = Path.Combine(destinationFolder, "Mentality.lnk");
+            var isDesktop = string.Equals(destinationFolder, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), StringComparison.OrdinalIgnoreCase);
+            var promptSuppressed = isDesktop ? Properties.Settings.Default.DesktopShortcutPromptSuppressed : Properties.Settings.Default.StartMenuShortcutPromptSuppressed;
+            var replaceApproved = isDesktop ? Properties.Settings.Default.DesktopShortcutReplaceApproved : Properties.Settings.Default.StartMenuShortcutReplaceApproved;
+            try
+            {
+                Directory.CreateDirectory(destinationFolder);
+                if (File.Exists(shortcutPath))
+                {
+                    Version existingVersion;
+                    if (IsShortcutForExactCurrentVersion(shortcutPath, out existingVersion))
+                    {
+                        lblStatus.Text = "A shortcut for this exact Mentality version already exists.";
+                        return;
+                    }
+                    if (!manual) return;
+
+                    if (!promptSuppressed)
+                    {
+                        using (var prompt = new Form())
+                        {
+                            prompt.Text = "Replace shortcut?";
+                            prompt.FormBorderStyle = FormBorderStyle.FixedDialog;
+                            prompt.StartPosition = FormStartPosition.CenterParent;
+                            prompt.ClientSize = new Size(430, 142);
+                            prompt.MinimizeBox = false;
+                            prompt.MaximizeBox = false;
+                            var promptLabel = new Label { Text = "A shortcut already exists here:\r\n" + shortcutPath + "\r\nReplace it with this version of Mentality?", Location = new Point(12, 10), Size = new Size(406, 56) };
+                            var suppress = new CheckBox { Text = "Do not show again for this location", Location = new Point(12, 72), Size = new Size(250, 22) };
+                            var yes = new Button { Text = "Replace", DialogResult = DialogResult.Yes, Location = new Point(244, 104), Size = new Size(80, 28) };
+                            var no = new Button { Text = "Cancel", DialogResult = DialogResult.No, Location = new Point(334, 104), Size = new Size(80, 28) };
+                            prompt.Controls.AddRange(new Control[] { promptLabel, suppress, yes, no });
+                            prompt.AcceptButton = yes;
+                            prompt.CancelButton = no;
+                            var result = prompt.ShowDialog(this);
+                            if (suppress.Checked)
+                            {
+                                if (isDesktop)
+                                {
+                                    Properties.Settings.Default.DesktopShortcutPromptSuppressed = true;
+                                    Properties.Settings.Default.DesktopShortcutReplaceApproved = result == DialogResult.Yes;
+                                }
+                                else
+                                {
+                                    Properties.Settings.Default.StartMenuShortcutPromptSuppressed = true;
+                                    Properties.Settings.Default.StartMenuShortcutReplaceApproved = result == DialogResult.Yes;
+                                }
+                                Properties.Settings.Default.Save();
+                            }
+                            if (result != DialogResult.Yes) return;
+                        }
+                    }
+                    else if (!replaceApproved)
+                    {
+                        lblStatus.Text = "Shortcut replacement was previously declined for this location.";
+                        return;
+                    }
+                }
+
+                WriteShortcut(shortcutPath);
+                lblStatus.Text = "Shortcut created in " + destinationFolder;
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                MessageBox.Show(this, ex.Message, "Shortcut creation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static bool IsShortcutForExactCurrentVersion(string shortcutPath, out Version version)
+        {
+            object shellObject = null;
+            object shortcutObject = null;
+            version = null;
+            try
+            {
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return false;
+                shellObject = Activator.CreateInstance(shellType);
+                dynamic shell = shellObject;
+                shortcutObject = shell.CreateShortcut(shortcutPath);
+                dynamic shortcut = shortcutObject;
+                var target = Convert.ToString(shortcut.TargetPath);
+                if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) return false;
+                version = System.Reflection.AssemblyName.GetAssemblyName(target).Version;
+                return string.Equals(System.Reflection.AssemblyName.GetAssemblyName(target).Name, "Mentality", StringComparison.OrdinalIgnoreCase)
+                    && version == typeof(Form1).Assembly.GetName().Version;
+            }
+            catch { return false; }
+            finally
+            {
+                if (shortcutObject != null && Marshal.IsComObject(shortcutObject)) Marshal.FinalReleaseComObject(shortcutObject);
+                if (shellObject != null && Marshal.IsComObject(shellObject)) Marshal.FinalReleaseComObject(shellObject);
+            }
+        }
+
+        private static void WriteShortcut(string shortcutPath)
+        {
+            object shellObject = null;
+            object shortcutObject = null;
+            try
+            {
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) throw new InvalidOperationException("Windows Script Host is unavailable; a shortcut could not be created.");
+                shellObject = Activator.CreateInstance(shellType);
+                dynamic shell = shellObject;
+                shortcutObject = shell.CreateShortcut(shortcutPath);
+                dynamic shortcut = shortcutObject;
+                shortcut.TargetPath = Application.ExecutablePath;
+                shortcut.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
+                shortcut.Description = "Mentality AutoClicker";
+                shortcut.IconLocation = Application.ExecutablePath + ",0";
+                shortcut.Save();
+            }
+            finally
+            {
+                if (shortcutObject != null && Marshal.IsComObject(shortcutObject)) Marshal.FinalReleaseComObject(shortcutObject);
+                if (shellObject != null && Marshal.IsComObject(shellObject)) Marshal.FinalReleaseComObject(shellObject);
+            }
+        }
+
+        private void RemoveShortcutClicked(string folder, string location)
+        {
+            try
+            {
+                var shortcutPath = Path.Combine(folder, "Mentality.lnk");
+                if (!File.Exists(shortcutPath))
+                {
+                    lblStatus.Text = "No Mentality shortcut was found in " + location + ".";
+                    return;
+                }
+                if (MessageBox.Show(this, "Remove the Mentality shortcut from " + location + "?", "Remove shortcut", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                File.Delete(shortcutPath);
+                lblStatus.Text = "Removed the Mentality shortcut from " + location + ".";
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                MessageBox.Show(this, ex.Message, "Shortcut removal failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void CreateAutomaticShortcuts()
+        {
+            if (Properties.Settings.Default.AutoCreateDesktopShortcut)
+                CreateAutomaticShortcut(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+            if (Properties.Settings.Default.AutoCreateStartMenuShortcut)
+                CreateAutomaticShortcut(StartMenuShortcutFolder);
+        }
+
+        private void CreateAutomaticShortcut(string folder)
+        {
+            try
+            {
+                var shortcutPath = Path.Combine(folder, "Mentality.lnk");
+                if (File.Exists(shortcutPath))
+                {
+                    Version existingVersion;
+                    if (IsShortcutForExactCurrentVersion(shortcutPath, out existingVersion)) return;
+                    return;
+                }
+                Directory.CreateDirectory(folder);
+                WriteShortcut(shortcutPath);
+            }
+            catch (Exception ex) { LogError(ex); }
+        }
+
+        private void TaskbarShortcutClicked(object sender, EventArgs e)
+        {
+            MessageBox.Show(this,
+                "Windows does not provide a supported API for reliably pinning or unpinning applications from the taskbar. Use the Mentality shortcut: right-click it and choose 'Pin to taskbar' or 'Unpin from taskbar'.",
+                "Taskbar pinning", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void OpenDataFolderClicked(object sender, EventArgs e)
+        {
+            try
+            {
+                var dataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Mentality");
+                Directory.CreateDirectory(dataFolder);
+                Process.Start(new ProcessStartInfo(dataFolder) { UseShellExecute = true });
+                lblStatus.Text = "Opened the Mentality data folder.";
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                MessageBox.Show(this, ex.Message, "Could not open data folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void RestartAsAdministratorClicked(object sender, EventArgs e)
+        {
+            if (IsRunningAsAdministrator())
+            {
+                lblStatus.Text = "Mentality is already running as Administrator.";
+                return;
+            }
+
+            UnregisterCurrentHotkey();
+            UnregisterShowAppHotkey();
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = Application.ExecutablePath,
+                    WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+                exitRequested = true;
+                this.Close();
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
+            {
+                TryRegisterHotkey();
+                TryRegisterShowAppHotkey();
+                lblStatus.Text = "Administrator restart was cancelled.";
+            }
+            catch (Exception ex)
+            {
+                TryRegisterHotkey();
+                TryRegisterShowAppHotkey();
+                LogError(ex);
+                MessageBox.Show(this, ex.Message, "Could not restart as Administrator", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void TryRegisterHotkey()
@@ -461,6 +1008,7 @@ namespace Mentality
             }
         }
 
+        private void StartTargetMonitor()
         private Profile CaptureCurrentSettings(string name)
         {
             return new Profile
@@ -502,7 +1050,6 @@ namespace Mentality
                     return;
                 }
 
-        private void StartTargetMonitor()
                 RefreshProfilesCombo();
                 cmbProfiles.SelectedItem = name;
                 lblStatus.Text = $"Saved profile '{name}'.";
@@ -539,11 +1086,72 @@ namespace Mentality
             printScreenHookCallback = null;
         }
 
+        private void BeginHotkeyCapture()
+        {
+            try
+            {
+                printScreenCaptureMode = true;
+                UnregisterCurrentHotkey();
+                txtHotkey.ReadOnly = false;
+                txtHotkey.Text = "Press combination... (PrtScr supported)";
+                txtHotkey.Focus();
+                printScreenHookCallback = PrintScreenKeyboardProc;
+                printScreenHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, printScreenHookCallback, GetModuleHandle(null), 0);
+                if (printScreenHookHandle == IntPtr.Zero)
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    printScreenCaptureMode = false;
+                    lblStatus.Text = "Could not start hotkey capture (error " + error + ").";
+                    LogError(new InvalidOperationException("Print Screen capture hook failed: " + error));
+                }
+            }
+            catch (Exception ex)
+            {
+                printScreenCaptureMode = false;
+                LogError(ex);
+            }
+        }
+
+        private void CompletePrintScreenCapture()
+        {
+            var modifiers = pendingPrintScreenModifiers;
+            printScreenCaptureMode = false;
+            selectedHotkey = Keys.PrintScreen;
+            selectedHotkeyModifiers = modifiers;
+            var parts = new System.Collections.Generic.List<string>();
+            if ((modifiers & MOD_CONTROL) != 0) parts.Add("Ctrl");
+            if ((modifiers & MOD_SHIFT) != 0) parts.Add("Shift");
+            if ((modifiers & MOD_ALT) != 0) parts.Add("Alt");
+            if ((modifiers & MOD_WIN) != 0) parts.Add("Win");
+            parts.Add("PrtScr");
+            txtHotkey.Text = string.Join("+", parts);
+            txtHotkey.ReadOnly = true;
+            Properties.Settings.Default.HotkeyKey = selectedHotkey.ToString();
+            Properties.Settings.Default.HotkeyModifiers = (int)selectedHotkeyModifiers;
+            Properties.Settings.Default.Save();
+            chkUseHotkey.Checked = true;
+            TryRegisterHotkey();
+            lblStatus.Text = "Print Screen hotkey captured and enabled.";
+        }
+
         private IntPtr PrintScreenKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0 && Marshal.ReadInt32(lParam) == VK_SNAPSHOT)
             {
                 var message = wParam.ToInt32();
+                if (printScreenCaptureMode && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN))
+                {
+                    printScreenKeyDown = true;
+                    pendingPrintScreenModifiers = 0;
+                    if (IsKeyDown(0x11)) pendingPrintScreenModifiers |= MOD_CONTROL;
+                    if (IsKeyDown(0x10)) pendingPrintScreenModifiers |= MOD_SHIFT;
+                    if (IsKeyDown(0x12)) pendingPrintScreenModifiers |= MOD_ALT;
+                    if (IsWinKeyDown()) pendingPrintScreenModifiers |= MOD_WIN;
+                    try { BeginInvoke(new Action(CompletePrintScreenCapture)); } catch { }
+                    return new IntPtr(1);
+                }
+                if (printScreenCaptureMode && (message == WM_KEYUP || message == WM_SYSKEYUP))
+                    return new IntPtr(1);
                 if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
                 {
                     if (printScreenKeyDown) return new IntPtr(1);
@@ -589,12 +1197,219 @@ namespace Mentality
         {
             base.OnHandleCreated(e);
             TryRegisterHotkey();
+            TryRegisterShowAppHotkey();
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
             UnregisterCurrentHotkey();
+            UnregisterShowAppHotkey();
             base.OnHandleDestroyed(e);
+        }
+
+        private void StartUpdateReminderChecks()
+        {
+            if (updateReminderTimer != null) return;
+            updateReminderTimer = new System.Windows.Forms.Timer { Interval = 6 * 60 * 60 * 1000 };
+            updateReminderTimer.Tick += async (s, e) => await CheckForUpdateReminderAsync();
+            updateReminderTimer.Start();
+            BeginInvoke(new Action(async () => await CheckForUpdateReminderAsync()));
+        }
+
+        private async Task CheckForUpdateReminderAsync()
+        {
+            if (updateCheckInProgress || IsDisposed) return;
+            updateCheckInProgress = true;
+            try
+            {
+                Properties.Settings.Default.LastUpdateCheckUtcTicks = DateTime.UtcNow.Ticks;
+                Properties.Settings.Default.Save();
+                var update = await Migrate.CheckForUpdateAsync(GetCurrentVersion());
+                if (update == null)
+                {
+                    Properties.Settings.Default.LastUpdateNotifiedVersion = string.Empty;
+                    Properties.Settings.Default.LastUpdateNotificationUtcTicks = 0;
+                    Properties.Settings.Default.Save();
+                    return;
+                }
+
+                var settings = Properties.Settings.Default;
+                var versionText = update.Version.ToString();
+                var sameVersion = string.Equals(settings.LastUpdateNotifiedVersion, versionText, StringComparison.OrdinalIgnoreCase);
+                var lastTicks = settings.LastUpdateNotificationUtcTicks;
+                var elapsed = lastTicks > 0 && lastTicks <= DateTime.MaxValue.Ticks
+                    ? DateTime.UtcNow - new DateTime(lastTicks, DateTimeKind.Utc)
+                    : TimeSpan.MaxValue;
+                if (!sameVersion || elapsed >= TimeSpan.FromHours(6))
+                {
+                    ShowUpdateNotification(update);
+                    settings.LastUpdateNotifiedVersion = versionText;
+                    settings.LastUpdateNotificationUtcTicks = DateTime.UtcNow.Ticks;
+                    settings.Save();
+                }
+            }
+            catch (Exception ex) { LogError(ex); }
+            finally { updateCheckInProgress = false; }
+        }
+
+        private void ShowUpdateNotification(UpdateInfo update)
+        {
+            if (trayIcon != null && trayIcon.Visible)
+            {
+                trayIcon.BalloonTipTitle = "Mentality update available";
+                trayIcon.BalloonTipText = "Version " + update.Version + " is available. Open Mentality to install it.";
+                trayIcon.BalloonTipIcon = ToolTipIcon.Info;
+                trayIcon.ShowBalloonTip(10000);
+                return;
+            }
+
+            if (updateNotifyIcon != null) updateNotifyIcon.Dispose();
+            updateNotifyIcon = new NotifyIcon
+            {
+                Icon = this.Icon ?? SystemIcons.Application,
+                Text = "Mentality update available",
+                Visible = true,
+                BalloonTipTitle = "Mentality update available",
+                BalloonTipText = "Version " + update.Version + " is available. Open Mentality to install it.",
+                BalloonTipIcon = ToolTipIcon.Info
+            };
+            updateNotifyIcon.BalloonTipClicked += (s, e) => ShowFromTray();
+            updateNotifyIcon.ShowBalloonTip(10000);
+            var disposeTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+            disposeTimer.Tick += (s, e) =>
+            {
+                disposeTimer.Stop();
+                disposeTimer.Dispose();
+                if (updateNotifyIcon != null)
+                {
+                    updateNotifyIcon.Visible = false;
+                    updateNotifyIcon.Dispose();
+                    updateNotifyIcon = null;
+                }
+            };
+            disposeTimer.Start();
+        }
+
+        private void Form1_Shown(object sender, EventArgs e)
+        {
+            CreateAutomaticShortcuts();
+            StartUpdateReminderChecks();
+            if (chkAlwaysActive.Checked)
+            {
+                try { SetAlwaysActiveStartup(true); }
+                catch (Exception ex) { LogError(ex); }
+                EnsureTrayIcon();
+                if (startInTray) HideToTray();
+            }
+            else if (startInTray)
+            {
+                EnsureTrayIcon();
+                HideToTray();
+            }
+        }
+
+        private void AlwaysActiveChanged(object sender, EventArgs e)
+        {
+            if (updatingAlwaysActive) return;
+
+            var enabled = chkAlwaysActive.Checked;
+            try
+            {
+                Properties.Settings.Default.AlwaysActive = enabled;
+                Properties.Settings.Default.Save();
+                SetAlwaysActiveStartup(enabled);
+
+                if (enabled)
+                {
+                    EnsureTrayIcon();
+                    lblStatus.Text = "Always Active is on; closing the window keeps Mentality in the tray.";
+                }
+                else
+                {
+                    DestroyTrayIcon();
+                    lblStatus.Text = "Always Active is off.";
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                updatingAlwaysActive = true;
+                chkAlwaysActive.Checked = !enabled;
+                updatingAlwaysActive = false;
+                Properties.Settings.Default.AlwaysActive = !enabled;
+                try { Properties.Settings.Default.Save(); } catch { }
+                lblStatus.Text = "Could not change Always Active. See the error log.";
+            }
+        }
+
+        private static void SetAlwaysActiveStartup(bool enabled)
+        {
+            const string runKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+            const string valueName = "Mentality";
+            if (enabled)
+            {
+                using (var runKey = Registry.CurrentUser.CreateSubKey(runKeyPath))
+                {
+                    if (runKey == null) throw new InvalidOperationException("Could not access the current-user startup settings.");
+                    var command = "\"" + Application.ExecutablePath + "\" --background";
+                    runKey.SetValue(valueName, command, RegistryValueKind.String);
+                }
+            }
+            else
+            {
+                using (var runKey = Registry.CurrentUser.OpenSubKey(runKeyPath, true))
+                {
+                    if (runKey != null && runKey.GetValue(valueName) != null)
+                        runKey.DeleteValue(valueName, false);
+                }
+            }
+        }
+
+        private void EnsureTrayIcon()
+        {
+            if (trayIcon != null) return;
+
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Open Mentality", null, (s, e) => ShowFromTray());
+            menu.Items.Add("Exit", null, ExitFromTray);
+            trayIcon = new NotifyIcon
+            {
+                Icon = this.Icon ?? SystemIcons.Application,
+                Text = "Mentality - Always Active",
+                ContextMenuStrip = menu,
+                Visible = true
+            };
+            trayIcon.DoubleClick += (s, e) => ShowFromTray();
+        }
+
+        private void HideToTray()
+        {
+            EnsureTrayIcon();
+            trayIcon.Visible = true;
+            this.ShowInTaskbar = false;
+            this.Hide();
+        }
+
+        private void ShowFromTray()
+        {
+            this.ShowInTaskbar = true;
+            this.Show();
+            if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal;
+            this.Activate();
+        }
+
+        private void ExitFromTray(object sender, EventArgs e)
+        {
+            exitRequested = true;
+            this.Close();
+        }
+
+        private void DestroyTrayIcon()
+        {
+            if (trayIcon == null) return;
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            trayIcon = null;
         }
 
         private CancellationTokenSource StartTargetMonitor(string[] entries)
@@ -761,6 +1576,21 @@ namespace Mentality
                 try { Migrate.UpgradeUserSettings(); }
                 catch (Exception ex) { LogError(ex); }
 
+                chkAlwaysActive.Checked = Properties.Settings.Default.AlwaysActive;
+                showAppHotkeyModifiers = (uint)Properties.Settings.Default.ShowAppHotkeyModifiers;
+                if (!Enum.TryParse(Properties.Settings.Default.ShowAppHotkeyKey, out showAppHotkey))
+                    showAppHotkey = Keys.None;
+                txtShowAppHotkey.Text = FormatShowAppHotkey();
+                chkKeepOnTop.Checked = Properties.Settings.Default.KeepOnTop;
+                this.TopMost = chkKeepOnTop.Checked;
+                chkRainbowTap.Checked = Properties.Settings.Default.RainbowTap;
+                if (chkRainbowTap.Checked) rainbowTimer.Start();
+                if (!string.IsNullOrWhiteSpace(Properties.Settings.Default.BackgroundColor))
+                {
+                    try { ApplyBackgroundColor(ColorTranslator.FromHtml(Properties.Settings.Default.BackgroundColor)); }
+                    catch (Exception ex) { LogError(ex); }
+                }
+
                 // load hotkey
                 try
                 {
@@ -828,7 +1658,7 @@ namespace Mentality
         private static Version GetCurrentVersion()
         {
             var version = typeof(Form1).Assembly.GetName().Version;
-            return new Version(version.Major, version.Minor, Math.Max(0, version.Build));
+            return new Version(version.Major, version.Minor, Math.Max(0, version.Build), Math.Max(0, version.Revision));
         }
 
         private async void CheckForUpdatesClicked(object sender, EventArgs e)
@@ -853,7 +1683,12 @@ namespace Mentality
             catch (Exception ex)
             {
                 availableUpdate = null;
-                lblUpdateStatus.Text = "Update check failed. Check your internet connection.";
+                if (ex is AggregateException)
+                    lblUpdateStatus.Text = "Could not reach either update source. Check your internet connection or proxy settings.";
+                else if (ex is InvalidDataException)
+                    lblUpdateStatus.Text = "Update sources responded, but no valid Windows release was listed.";
+                else
+                    lblUpdateStatus.Text = "Update check failed. See the error log for details.";
                 LogError(ex);
             }
             finally
@@ -874,6 +1709,7 @@ namespace Mentality
                 var progress = new Progress<string>(message => lblUpdateStatus.Text = message);
                 var packagePath = await Migrate.DownloadUpdateAsync(availableUpdate, progress);
                 Migrate.StartInstall(packagePath, Application.ExecutablePath, Process.GetCurrentProcess().Id);
+                exitRequested = true;
                 Close();
             }
             catch (Exception ex)
@@ -1043,9 +1879,20 @@ namespace Mentality
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (chkAlwaysActive.Checked && !exitRequested && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+
             StopAutoClicker();
             try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
             UnregisterCurrentHotkey();
+            UnregisterShowAppHotkey();
+            rainbowTimer.Stop();
+            clickCountTimer.Stop();
+            DestroyTrayIcon();
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1118,6 +1965,11 @@ namespace Mentality
                 try { Audit($"WM_HOTKEY received (id={HOTKEY_ID})"); } catch { }
                 // toggle
                 if (isClicking) StopAutoClicker(); else StartAutoClicker();
+                return;
+            }
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == SHOW_APP_HOTKEY_ID)
+            {
+                ShowFromTray();
                 return;
             }
             base.WndProc(ref m);
@@ -1196,6 +2048,7 @@ namespace Mentality
             }
 
             isClicking = true;
+            if (chkRainbowTap.Checked) rainbowTimer.Start();
             var generation = ++autoClickerGeneration;
             btnStartClicker.Enabled = false;
             btnStopClicker.Enabled = true;
@@ -1236,6 +2089,8 @@ namespace Mentality
 
             autoClickerCts = new CancellationTokenSource();
             var token = autoClickerCts.Token;
+            var clickerCts = autoClickerCts;
+            var token = clickerCts.Token;
 
             // capture schedule settings
             DateTime? scheduledStart = null;
@@ -1248,8 +2103,6 @@ namespace Mentality
                     scheduledEnd = scheduledStart.Value.AddMinutes((double)nudRunMinutes.Value);
                 }
             }
-            var clickerCts = autoClickerCts;
-            var token = clickerCts.Token;
 
             // start target monitor if targeting specific apps
             try { if (chkLimitToSpecificWindow != null && chkLimitToSpecificWindow.Checked) StartTargetMonitor(); } catch { }
@@ -1391,6 +2244,7 @@ namespace Mentality
                                 mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
                             }
                             PerformClick(clickType);
+                            Interlocked.Add(ref clickCount, clickType == 1 ? 2 : 1);
                         }
 
                         int interval = 10;
@@ -1468,6 +2322,7 @@ namespace Mentality
             try { autoClickerCts?.Cancel(); } catch { }
             autoClickerCts = null;
             isClicking = false;
+            lblStatus.ForeColor = originalStatusForeColor;
             btnStartClicker.Enabled = true;
             btnStopClicker.Enabled = false;
             progressBar.Visible = false;
